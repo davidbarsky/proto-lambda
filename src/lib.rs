@@ -1,18 +1,36 @@
 #![feature(async_await)]
+#![deny(clippy::all, clippy::pedantic)]
 #![warn(
     // missing_debug_implementations,
     missing_docs,
     nonstandard_style,
     rust_2018_idioms
 )]
-//! This is the core of the Lambda Runtime.
 
+//! This is the core of the Lambda Runtime.
 use futures::future::BoxFuture;
 use futures::prelude::*;
 use futures::task::{Context, Poll};
+use http::{Request, Response};
+use std::marker::Unpin;
 use std::pin::Pin;
 
 type Err = Box<dyn ::std::error::Error + Send + Sync + 'static>;
+
+pub trait Client<'a>: Send + Sync + Unpin {
+    type Fut: Future<Output = String> + Send + 'a;
+    fn call(&self, req: String) -> Self::Fut;
+}
+
+struct Actual;
+
+impl<'a> Client<'a> for Actual {
+    type Fut = BoxFuture<'a, String>;
+    fn call(&self, req: String) -> Self::Fut {
+        let fut = async move { req };
+        fut.boxed()
+    }
+}
 
 /// The `Stream` implementation for `EventStream` converts a `Future`
 /// containing the next event from the Lambda Runtime into a continuous
@@ -22,28 +40,37 @@ type Err = Box<dyn ::std::error::Error + Send + Sync + 'static>;
 /// For Lambda functions that receive a “warm wakeup”—i.e., the function is
 /// readily available in the Lambda service's cache—this runtime is able
 /// to immediately fetch the next event.
-pub struct EventStream<'a> {
-    current: Option<BoxFuture<'a, Result<String, Err>>>,
+pub struct EventStream<'a, T>
+where
+    T: Client<'a>,
+{
+    current: Option<BoxFuture<'a, String>>,
+    client: T,
 }
 
-trait Client {
-    fn call() -> BoxFuture<'static, Result<String, Err>>;
-}
-
-impl<'a> EventStream<'a> {
-    fn new() -> Self {
-        Self { current: None }
+impl<'a, T> EventStream<'a, T>
+where
+    T: Client<'a>,
+{
+    fn new(inner: T) -> Self {
+        Self {
+            current: None,
+            client: inner,
+        }
     }
 
-    fn next_event(&self) -> BoxFuture<'a, Result<String, Err>> {
-        let res = async { Ok(String::from("hello")) };
+    fn next_event(&self) -> BoxFuture<'a, String> {
+        let res = { self.client.call(String::from("hello")) };
         Box::pin(res)
     }
 }
 
 #[must_use = "streams do nothing unless you `.await` or poll them"]
-impl<'stream> Stream for EventStream<'stream> {
-    type Item = Result<String, Err>;
+impl<'a, T> Stream for EventStream<'a, T>
+where
+    T: Client<'a>,
+{
+    type Item = String;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // The `loop` is used to drive the inner future (`current`) to completion, advancing
@@ -71,4 +98,14 @@ impl<'stream> Stream for EventStream<'stream> {
             }
         }
     }
+}
+
+#[runtime::test]
+async fn get_next() -> Result<(), Err> {
+    let mut stream = EventStream::new(Actual);
+    if let Some(event) = stream.next().await {
+        println!("{:?}", event);
+    }
+
+    Ok(())
 }
