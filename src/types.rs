@@ -1,7 +1,8 @@
+use failure::{format_err, Error as Err};
 use headers::{Header, HeaderMap, HeaderMapExt, HeaderName, HeaderValue};
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::{collections::HashMap, convert::TryFrom};
 
 lazy_static! {
     static ref AWS_REQUEST_ID: HeaderName =
@@ -180,12 +181,20 @@ pub struct Context {
     pub identity: Option<CognitoIdentity>,
 }
 
-impl Context {
-    pub fn new(headers: HeaderMap<HeaderValue>) -> Option<Self> {
-        let request_id = headers.typed_get::<RequestId>()?;
-        let function_arn = headers.typed_get::<FunctionArn>()?;
-        let deadline = headers.typed_get::<InvocationDeadline>()?;
-        let xray = headers.typed_get::<XRayTraceId>();
+impl TryFrom<HeaderMap<HeaderValue>> for Context {
+    type Error = failure::Error;
+
+    fn try_from(value: HeaderMap<HeaderValue>) -> Result<Self, Self::Error> {
+        let request_id = value
+            .typed_get::<RequestId>()
+            .ok_or(format_err!("RequestId not found"))?;
+        let function_arn = value
+            .typed_get::<FunctionArn>()
+            .ok_or(format_err!("FunctionArn not found"))?;
+        let deadline = value
+            .typed_get::<InvocationDeadline>()
+            .ok_or(format_err!("FunctionArn not found"))?;
+        let xray = value.typed_get::<XRayTraceId>();
 
         let ctx = Context {
             aws_request_id: request_id.0,
@@ -194,7 +203,7 @@ impl Context {
             xray_trace_id: xray.map(|v| v.0),
             ..Default::default()
         };
-        Some(ctx)
+        Ok(ctx)
     }
 }
 

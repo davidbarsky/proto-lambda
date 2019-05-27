@@ -1,17 +1,14 @@
 #![feature(async_await)]
 #![deny(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
-#![warn(
-    // missing_debug_implementations,
-    missing_docs,
-    nonstandard_style,
-    rust_2018_idioms
-)]
+#![warn(missing_docs, nonstandard_style, rust_2018_idioms)]
 
 //! This is the core of the Lambda Runtime.
+use crate::requests::{InvocationErrRequest, InvocationRequest, NextEventRequest};
+use bytes::Bytes;
 use envy;
-use failure::{format_err, Error as Err};
+use failure::{bail, format_err, Error as Err};
 use futures::{
-    future::BoxFuture,
+    future::{BoxFuture, IntoFuture},
     prelude::*,
     task::{Context, Poll},
 };
@@ -19,9 +16,14 @@ use http::{
     uri::{Authority, PathAndQuery, Scheme},
     Method, Request, Response, Uri,
 };
-use serde::{Deserialize, Serialize};
-use std::{marker::Unpin, pin::Pin};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::{
+    convert::{TryFrom, TryInto},
+    marker::Unpin,
+    pin::Pin,
+};
 
+pub mod requests;
 pub mod types;
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -41,21 +43,21 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn from_env() -> Self {
-        envy::from_env::<Config>().unwrap()
+    pub fn from_env() -> Result<Self, Err> {
+        let conf = envy::from_env::<Config>()?;
+        Ok(conf)
     }
 }
 
-struct Client<T> {
+#[derive(Debug, PartialEq)]
+struct Client {
     base: (Scheme, Authority),
-    _marker: std::marker::PhantomData<T>,
 }
 
-impl<T> Client<T> {
+impl Client {
     fn new(scheme: Scheme, authority: Authority) -> Self {
         Self {
             base: (scheme, authority),
-            _marker: std::marker::PhantomData,
         }
     }
 
@@ -69,19 +71,28 @@ impl<T> Client<T> {
     }
 }
 
-/// Fetches the next event from Lambda's
-pub trait EventClient<'a, T>: Send + Sync + Unpin {
-    type Fut: Future<Output = Result<Response<T>, Err>> + Send + 'a;
-    fn call(&self, req: Request<T>) -> Self::Fut;
+/// A client responsible for interacting with the [Lambda Runtime API](https://docs.aws.amazon.com/lambda/latest/dg/runtimes-api.html).
+pub trait EventClient<'a>: Send + Sync + Unpin {
+    type Fut: Future<Output = Result<Response<Bytes>, Err>> + Send + 'a;
+    fn get(&self, req: Request<()>) -> Self::Fut;
+    fn post(&self, req: Request<Bytes>) -> Self::Fut;
 }
 
-impl<'a, T> EventClient<'a, T> for Client<T>
-where
-    T: Send + Sync + Unpin + 'a,
-{
-    type Fut = BoxFuture<'a, Result<Response<T>, Err>>;
-    fn call(&self, req: Request<T>) -> Self::Fut {
-        let fut = async move { Ok(Response::new(req.into_body())) };
+impl<'a> EventClient<'a> for Client {
+    type Fut = BoxFuture<'a, Result<Response<Bytes>, Err>>;
+    fn get(&self, req: Request<()>) -> Self::Fut {
+        let fut = async move {
+            let res = Response::builder().body(Bytes::new()).unwrap();
+            Ok(res)
+        };
+        fut.boxed()
+    }
+
+    fn post(&self, req: Request<Bytes>) -> Self::Fut {
+        let fut = async move {
+            let res = Response::builder().body(Bytes::new()).unwrap();
+            Ok(res)
+        };
         fut.boxed()
     }
 }
@@ -94,18 +105,17 @@ where
 /// For Lambda functions that receive a “warm wakeup”—i.e., the function is
 /// readily available in the Lambda service's cache—this runtime is able
 /// to immediately fetch the next event.
-pub struct EventStream<'a, T, U>
+pub struct EventStream<'a, T>
 where
-    T: EventClient<'a, U>,
+    T: EventClient<'a>,
 {
-    current: Option<BoxFuture<'a, Result<Response<U>, Err>>>,
+    current: Option<BoxFuture<'a, Result<Response<Bytes>, Err>>>,
     client: &'a T,
 }
 
-impl<'a, T, U> EventStream<'a, T, U>
+impl<'a, T> EventStream<'a, T>
 where
-    T: EventClient<'a, U>,
-    U: Default,
+    T: EventClient<'a>,
 {
     fn new(inner: &'a T) -> Self {
         Self {
@@ -114,62 +124,19 @@ where
         }
     }
 
-    fn next_event(&self) -> BoxFuture<'a, Result<Response<U>, Err>> {
-        let req = make_next_event_request().unwrap();
-        let fut = self.client.call(req);
+    fn next_event(&self) -> BoxFuture<'a, Result<Response<Bytes>, Err>> {
+        let req = NextEventRequest::new().try_into().unwrap();
+        let fut = self.client.get(req);
         Box::pin(fut)
     }
 }
 
-fn make_next_event_request<T: Default>() -> Result<Request<T>, Err> {
-    let uri = Uri::builder()
-        .path_and_query("/2018-06-01/runtime/invocation/next")
-        .build()?;
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri(uri)
-        .body(Default::default())?;
-    Ok(req)
-}
-
-fn make_init_err() -> Result<Request<String>, Err> {
-    let uri = Uri::builder()
-        .path_and_query("/2018-06-01/runtime/invocation/next")
-        .build()?;
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri(uri)
-        .body(Default::default())?;
-    Ok(req)
-}
-
-fn ok_resp(event_id: String) -> Result<Request<String>, Err> {
-    let query: &str = &format!("/2018-06-01/runtime/invocation/{}/response", event_id);
-    let uri = Uri::builder().path_and_query(query).build()?;
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri(uri)
-        .body(Default::default())?;
-    Ok(req)
-}
-
-fn err_resp(event_id: String) -> Result<Request<String>, Err> {
-    let query: &str = &format!("/2018-06-01/runtime/invocation/{}/error", event_id);
-    let uri = Uri::builder().path_and_query(query).build()?;
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri(uri)
-        .body(Default::default())?;
-    Ok(req)
-}
-
 #[must_use = "streams do nothing unless you `.await` or poll them"]
-impl<'a, T, U> Stream for EventStream<'a, T, U>
+impl<'a, T> Stream for EventStream<'a, T>
 where
-    T: EventClient<'a, U>,
-    U: Default,
+    T: EventClient<'a>,
 {
-    type Item = Result<Response<U>, Err>;
+    type Item = Result<Response<Bytes>, Err>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // The `loop` is used to drive the inner future (`current`) to completion, advancing
@@ -177,7 +144,7 @@ where
         // common in many hand-implemented `Futures` and `Streams`.
         loop {
             // The stream first checks an inner future is set. If the future is present,
-            // the a futures runtime like Tokio polls the inner future to completition.
+            // a runtime polls the inner future to completion.
             if let Some(current) = &mut self.current {
                 match current.as_mut().poll(cx) {
                     // If the inner future signals readiness, we:
@@ -188,8 +155,8 @@ where
                         self.current = Some(self.next_event());
                         return Poll::Ready(Some(res));
                     }
-                    // Otherwise, the future signals that it's not ready, so we do the same
-                    // to the Tokio runtime.
+                    // Otherwise, the future signals that it's not ready, so we propagate the
+                    // Poll::Pending signal to the caller.
                     Poll::Pending => return Poll::Pending,
                 }
             } else {
@@ -201,34 +168,35 @@ where
 
 #[runtime::test]
 async fn get_next() -> Result<(), Err> {
-    let config = Config::from_env();
+    let mut config = Config::default();
+    config.endpoint = String::from("http://localhost:8000");
 
     let uri: Uri = config.endpoint.parse::<Uri>()?;
     let parts = uri.into_parts();
     let scheme = parts.scheme.ok_or(format_err!("scheme not found"))?;
     let authority = parts.authority.ok_or(format_err!("authority not found"))?;
 
-    let client: Client<String> = Client::new(scheme, authority);
+    let client = Client::new(scheme, authority);
     let mut stream = EventStream::new(&client);
-    if let Some(event) = stream.next().await {
-        // pretend handling of an event!
-        let (_headers, body) = event?.into_parts();
-        match handle(body) {
+    while let Some(event) = stream.next().await {
+        let (parts, body) = event?.into_parts();
+        let ctx = types::Context::try_from(parts.headers)?;
+
+        let f = |bytes| bytes;
+
+        match f(body) {
             Ok(res) => {
-                let req = ok_resp(res)?;
-                client.call(req).await?;
+                let req =
+                    InvocationRequest::from_components(ctx.aws_request_id, res)?.try_into()?;
+                client.post(req).await?;
             }
             Err(e) => {
-                let req = err_resp(e.to_string())?;
-                client.call(req).await?;
+                let req = InvocationErrRequest::from_components(ctx.aws_request_id, Bytes::new())?
+                    .try_into()?;
+                client.post(req).await?;
             }
         }
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-fn handle(event: String) -> Result<String, Err> {
-    Ok(event)
 }

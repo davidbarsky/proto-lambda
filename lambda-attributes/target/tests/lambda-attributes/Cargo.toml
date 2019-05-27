@@ -1,0 +1,40 @@
+[package]
+name = "lambda-attributes-tests"
+version = "0.0.0"
+edition = "2018"
+publish = false
+[dependencies.lambda-attributes]
+path = "/Users/dbarsky/Developer/Rust/proto-lambda/lambda-attributes"
+default-features = false
+
+[dependencies.proc-macro2]
+version = "0.4.29"
+features = ["nightly"]
+
+[dependencies.quote]
+version = "0.6.12"
+
+[dependencies.runtime]
+version = "0.3.0-alpha.4"
+
+[dependencies.syn]
+version = "0.15.33"
+features = ["full"]
+
+[[bin]]
+name = "lambda-attributes-tests"
+path = "main.rs"
+
+[[bin]]
+name = "trybuild000"
+path = "/Users/dbarsky/Developer/Rust/proto-lambda/lambda-attributes/tests/ui/parse.rs"
+
+[[bin]]
+name = "trybuild001"
+path = "/Users/dbarsky/Developer/Rust/proto-lambda/lambda-attributes/tests/ui/parse-one-arg.rs"
+
+[[bin]]
+name = "trybuild002"
+path = "/Users/dbarsky/Developer/Rust/proto-lambda/lambda-attributes/tests/ui/non-async-main.rs"
+
+[workspace]
