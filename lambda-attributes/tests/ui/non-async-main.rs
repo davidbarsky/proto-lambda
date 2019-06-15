@@ -1,2 +1,2 @@
-#[lambda_attributes::main]
+#[lambda_attributes::lambda]
 fn main() {}

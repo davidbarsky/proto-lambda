@@ -6,7 +6,7 @@ use syn::{spanned::Spanned, Expr, FnArg, ItemFn};
 
 #[cfg(not(test))]
 #[proc_macro_attribute]
-pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn lambda(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let rt: Expr = syn::parse_str("runtime::native::Native").unwrap();
     let input = syn::parse_macro_input!(item as ItemFn);
 
@@ -31,20 +31,6 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     let result = match inputs.len() {
-        0 => {
-            quote_spanned! { input.span() =>
-                #(#attrs)*
-                fn main() #ret {
-                    async fn main(#(#inputs),*) #ret {
-                        #body
-                    }
-
-                    runtime::raw::enter(#rt, async {
-                        main().await
-                    })
-                }
-            }
-        }
         1 => {
             let arg = match inputs.first().unwrap().into_value() {
                 FnArg::Captured(arg) => arg,
@@ -58,20 +44,20 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
             let arg_name = &arg.pat;
             let arg_type = &arg.ty;
             quote_spanned! { input.span() =>
-                fn main() #ret {
-                    async fn main(#arg_name: Option<#arg_type>) #ret {
+                fn main() {
+                    async fn actual(#arg_name: #arg_type) #ret {
                         #body
                     }
 
                     runtime::raw::enter(#rt, async move {
-                        main(None).await
-                    })
+                        actual(#arg).await.unwrap();
+                    });
                 }
             }
         }
         _ => {
             let tokens = quote_spanned! { inputs.span() =>
-                compile_error!("fn main can take 0 or 1 arguments");
+                compile_error!("fn main can only take 1 argument");
             };
             return TokenStream::from(tokens);
         }

@@ -1,4 +1,4 @@
 #![feature(async_await)]
 
-#[lambda_attributes::main]
+#[lambda_attributes::lambda]
 async fn main() {}

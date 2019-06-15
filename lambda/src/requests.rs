@@ -1,5 +1,5 @@
+use crate::{Err, ErrorReport};
 use bytes::Bytes;
-use failure::Error as Err;
 use http::{uri::PathAndQuery, Method, Request, Uri};
 use std::convert::TryInto;
 
@@ -103,12 +103,12 @@ impl TryInto<Request<Bytes>> for InvocationRequest {
 /// ```
 pub struct InvocationErrRequest {
     path_and_query: PathAndQuery,
-    response: Bytes,
+    response: ErrorReport,
 }
 
 impl InvocationErrRequest {
     /// Fallibly constructs an `InvocationErrRequest`.
-    pub fn from_components(request_id: String, response: Bytes) -> Result<Self, Err> {
+    pub fn from_components(request_id: String, response: ErrorReport) -> Result<Self, Err> {
         let path = format!("2018-06-01/runtime/invocation/{}/error", request_id);
         let path_and_query = PathAndQuery::from_shared(Bytes::from(path))?;
         let req = InvocationErrRequest {
@@ -120,14 +120,15 @@ impl InvocationErrRequest {
 }
 
 impl TryInto<Request<Bytes>> for InvocationErrRequest {
-    type Error = http::Error;
+    type Error = Err;
 
     fn try_into(self) -> Result<Request<Bytes>, Self::Error> {
         let uri = Uri::builder().path_and_query(self.path_and_query).build()?;
+        let body = serde_json::to_vec(&self.response)?;
         let req = Request::builder()
             .method(Method::POST)
             .uri(uri)
-            .body(self.response)?;
+            .body(body.into())?;
         Ok(req)
     }
 }
