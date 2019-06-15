@@ -3,7 +3,6 @@
 #![warn(missing_docs, nonstandard_style, rust_2018_idioms)]
 
 //! This is the core of the Lambda Runtime.
-use crate::requests::{InvocationErrRequest, InvocationRequest, NextEventRequest};
 use bytes::Bytes;
 use failure::format_err;
 use futures::{
@@ -13,11 +12,11 @@ use futures::{
 };
 use http::{
     uri::{Authority, Scheme},
-    Request, Response, Uri,
+    Method, Request, Response, Uri,
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    convert::{TryFrom, TryInto},
+    convert::TryFrom,
     env,
     marker::Unpin,
     mem,
@@ -28,7 +27,6 @@ use std::{
 
 pub use lambda_attributes::lambda;
 
-mod requests;
 /// A module containing various types availible a Lambda function.
 pub mod types;
 
@@ -68,14 +66,13 @@ impl Config {
 
 #[derive(Debug, PartialEq)]
 struct Client {
-    base: (Scheme, Authority),
+    scheme: Scheme,
+    authority: Authority,
 }
 
 impl Client {
     fn new(scheme: Scheme, authority: Authority) -> Self {
-        Self {
-            base: (scheme, authority),
-        }
+        Self { scheme, authority }
     }
 }
 
@@ -83,25 +80,44 @@ impl Client {
 trait EventClient<'a>: Send + Sync + Unpin {
     /// A future containing the next event from the Lambda Runtime API.
     type Fut: Future<Output = Result<Response<Bytes>, Err>> + Send + 'a;
-    fn get(&self, req: Request<()>) -> Self::Fut;
-    fn post(&self, req: Request<Bytes>) -> Self::Fut;
+    fn call(&self, req: Request<Bytes>) -> Self::Fut;
 }
 
 impl<'a> EventClient<'a> for Client {
     type Fut = BoxFuture<'a, Result<Response<Bytes>, Err>>;
-    fn get(&self, _req: Request<()>) -> Self::Fut {
-        let fut = async move {
-            let res = Response::builder().body(Bytes::new()).unwrap();
-            Ok(res)
-        };
-        fut.boxed()
-    }
 
-    fn post(&self, _req: Request<Bytes>) -> Self::Fut {
-        let fut = async move {
-            let res = Response::builder().body(Bytes::new()).unwrap();
+    fn call(&self, req: Request<Bytes>) -> Self::Fut {
+        use futures::compat::{Future01CompatExt, Stream01CompatExt};
+        use pin_utils::pin_mut;
+
+        let (mut parts, body) = req.into_parts();
+        let pq = parts.uri.path_and_query().unwrap();
+        let uri = Uri::builder()
+            .scheme(self.scheme.clone())
+            .authority(self.authority.clone())
+            .path_and_query(pq.clone())
+            .build()
+            .unwrap();
+        parts.uri = uri;
+        let body = hyper::Body::from(body);
+        let req = Request::from_parts(parts, body);
+
+        let fut = async {
+            let res = hyper::Client::new().request(req).compat().await?;
+            let (parts, body) = res.into_parts();
+            let body = body.compat();
+            pin_mut!(body);
+
+            let mut buf: Vec<u8> = vec![];
+            while let Some(Ok(chunk)) = body.next().await {
+                let mut chunk: Vec<u8> = chunk.into_bytes().to_vec();
+                buf.append(&mut chunk)
+            }
+            let buf = Bytes::from(buf);
+            let res = Response::from_parts(parts, buf);
             Ok(res)
         };
+
         fut.boxed()
     }
 }
@@ -134,8 +150,12 @@ where
     }
 
     fn next_event(&self) -> BoxFuture<'a, Result<Response<Bytes>, Err>> {
-        let req = NextEventRequest::new().try_into().unwrap();
-        Box::pin(self.client.get(req))
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(Uri::from_static("/runtime/invocation/next"))
+            .body(Bytes::new())
+            .unwrap();
+        Box::pin(self.client.call(req))
     }
 }
 
@@ -327,20 +347,42 @@ where
         match handler.call(body).await {
             Ok(res) => {
                 let res = serde_json::to_vec(&res)?;
-                let req = InvocationRequest::from_components(ctx.aws_request_id, res.into())?
-                    .try_into()?;
-                client.post(req).await?;
+                let uri = generate_uri(&ctx.aws_request_id, Route::Ok)?;
+                let req = Request::builder()
+                    .uri(uri)
+                    .method(Method::POST)
+                    .body(Bytes::from(res))?;
+
+                client.call(req).await?;
             }
-            Err(e) => {
-                let e = error(e.into());
-                let req =
-                    InvocationErrRequest::from_components(ctx.aws_request_id, e)?.try_into()?;
-                client.post(req).await?;
+            Err(err) => {
+                let err = error(err.into());
+                let err = serde_json::to_vec(&err)?;
+                let uri = generate_uri(&ctx.aws_request_id, Route::Err)?;
+                let req = Request::builder()
+                    .uri(uri)
+                    .method(Method::POST)
+                    .body(Bytes::from(err))?;
+
+                client.call(req).await?;
             }
         }
     }
 
     Ok(())
+}
+
+enum Route {
+    Err,
+    Ok,
+}
+
+fn generate_uri(id: &str, route: Route) -> Result<Uri, http::uri::InvalidUri> {
+    let uri = match route {
+        Route::Ok => format!("/runtime/invocation/{id}/response", id = id),
+        Route::Err => format!("/runtime/invocation/{id}/error", id = id),
+    };
+    uri.parse::<Uri>()
 }
 
 /// Runs an [HttpHandler].
@@ -367,17 +409,26 @@ where
 
         match handler.call(req).await {
             Ok(res) => {
-                let (_parts, body) = res.into_parts();
-                let body = serde_json::to_vec(&body)?;
-                let req = InvocationRequest::from_components(ctx.aws_request_id, body.into())?
-                    .try_into()?;
-                client.post(req).await?;
+                let (parts, body) = res.into_parts();
+                let res = serde_json::to_vec(&body)?;
+                let uri = generate_uri(&ctx.aws_request_id, Route::Ok)?;
+                let req = Request::builder()
+                    .uri(uri)
+                    .method(Method::POST)
+                    .body(Bytes::from(res))?;
+
+                client.call(req).await?;
             }
-            Err(e) => {
-                let e = error(e.into());
-                let req =
-                    InvocationErrRequest::from_components(ctx.aws_request_id, e)?.try_into()?;
-                client.post(req).await?;
+            Err(err) => {
+                let err = error(err.into());
+                let err = serde_json::to_vec(&err)?;
+                let uri = generate_uri(&ctx.aws_request_id, Route::Err)?;
+                let req = Request::builder()
+                    .uri(uri)
+                    .method(Method::POST)
+                    .body(Bytes::from(err))?;
+
+                client.call(req).await?;
             }
         }
     }
