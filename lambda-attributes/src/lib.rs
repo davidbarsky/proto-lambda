@@ -1,19 +1,19 @@
 extern crate proc_macro;
 
 use proc_macro::TokenStream;
-use quote::{quote, quote_spanned};
-use syn::{spanned::Spanned, Expr, FnArg, ItemFn};
+use quote::quote_spanned;
+use syn::{spanned::Spanned, FnArg, ItemFn};
 
 #[cfg(not(test))]
 #[proc_macro_attribute]
 pub fn lambda(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let rt: Expr = syn::parse_str("runtime::native::Native").unwrap();
     let input = syn::parse_macro_input!(item as ItemFn);
 
     let ret = &input.decl.output;
     let name = &input.ident;
     let body = &input.block;
     let attrs = &input.attrs;
+    let asyncness = &input.asyncness;
     let inputs = &input.decl.inputs;
 
     if name != "main" {
@@ -23,7 +23,7 @@ pub fn lambda(_attr: TokenStream, item: TokenStream) -> TokenStream {
         return TokenStream::from(tokens);
     }
 
-    if input.asyncness.is_none() {
+    if asyncness.is_none() {
         let tokens = quote_spanned! { input.span() =>
           compile_error!("the async keyword is missing from the function declaration");
         };
@@ -44,14 +44,14 @@ pub fn lambda(_attr: TokenStream, item: TokenStream) -> TokenStream {
             let arg_name = &arg.pat;
             let arg_type = &arg.ty;
             quote_spanned! { input.span() =>
-                fn main() {
+                #(#attrs)*
+                #asyncness fn main() {
                     async fn actual(#arg_name: #arg_type) #ret {
                         #body
                     }
+                    let f = lambda::handler_fn(actual);
 
-                    runtime::raw::enter(#rt, async move {
-                        actual(#arg).await.unwrap();
-                    });
+                    lambda::run(f).await.unwrap();
                 }
             }
         }

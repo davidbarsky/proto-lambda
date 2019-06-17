@@ -6,6 +6,6 @@ use trybuild::TestCases;
 fn tests() {
     let t = TestCases::new();
     t.compile_fail("tests/ui/parse.rs");
-    t.compile_fail("tests/ui/parse-one-arg.rs");
+    t.pass("tests/ui/parse-one-arg.rs");
     t.compile_fail("tests/ui/non-async-main.rs")
 }
