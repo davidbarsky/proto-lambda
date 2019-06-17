@@ -4,7 +4,6 @@
 
 //! This is the core of the Lambda Runtime.
 use bytes::Bytes;
-use failure::format_err;
 use futures::{
     future::BoxFuture,
     prelude::*,
@@ -29,8 +28,29 @@ pub use lambda_attributes::lambda;
 
 /// A module containing various types availible a Lambda function.
 pub mod types;
+use crate::types::LambdaCtx;
 
 type Err = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+#[derive(Debug)]
+/// A string error, which can be display
+pub(crate) struct StringError(pub String);
+
+impl std::error::Error for StringError {}
+
+impl std::fmt::Display for StringError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
+        self.0.fmt(f)
+    }
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! err_fmt {
+    {$($t:tt)*} => {
+        $crate::StringError(format!($($t)*))
+    }
+}
 
 /// A struct containing configuration values derived from environment variables.
 #[derive(Debug, Default)]
@@ -247,6 +267,10 @@ fn set_err_hook() {
             default_error_hook(err)
         }
     });
+
+    let e = err_fmt!("An error");
+    let e = error(e.into());
+    assert_eq!(String::from("UnknownError"), e.name)
 }
 
 /// Returns a new `HandlerFn` with the given closure.
@@ -260,48 +284,48 @@ pub struct HandlerFn<F> {
     f: F,
 }
 
-impl<F, In, Out, E, Fut> Handler<In, Out> for HandlerFn<F>
+impl<F, A, B, E, Fut> Handler<A, B> for HandlerFn<F>
 where
-    F: Fn(In) -> Fut,
-    In: for<'de> Deserialize<'de>,
-    Out: Serialize,
+    F: Fn(A) -> Fut,
+    A: for<'de> Deserialize<'de>,
+    B: Serialize,
     E: Into<Err>,
-    Fut: Future<Output = Result<Out, E>> + Send,
+    Fut: Future<Output = Result<B, E>> + Send,
 {
     type Err = E;
     type Fut = Fut;
-    fn call(&mut self, req: In) -> Self::Fut {
+    fn call(&mut self, req: A) -> Self::Fut {
         (self.f)(req)
     }
 }
 
-impl<F, In, Out, E, Fut> HttpHandler<In, Out> for HandlerFn<F>
+impl<F, A, B, E, Fut> HttpHandler<A, B> for HandlerFn<F>
 where
-    F: Fn(Request<In>) -> Fut,
-    In: for<'de> Deserialize<'de>,
-    Out: Serialize,
+    F: Fn(Request<A>) -> Fut,
+    A: for<'de> Deserialize<'de>,
+    B: Serialize,
     E: Into<Err>,
-    Fut: Send + Future<Output = Result<Response<Out>, E>>,
+    Fut: Send + Future<Output = Result<Response<B>, E>>,
 {
     type Err = E;
     type Fut = Fut;
-    fn call(&mut self, req: Request<In>) -> Self::Fut {
+    fn call(&mut self, req: Request<A>) -> Self::Fut {
         (self.f)(req)
     }
 }
 
 /// A trait describing an asynchronous function from `In` to `Out`. `In` and `Out` must implement [`Deserialize`](serde::Deserialize) and [`Serialize`](serde::Serialize).
-pub trait Handler<In, Out>
+pub trait Handler<A, B>
 where
-    In: for<'de> Deserialize<'de>,
-    Out: Serialize,
+    A: for<'de> Deserialize<'de>,
+    B: Serialize,
 {
     /// Errors returned by this handler.
     type Err: Into<Err>;
     /// The future response value of this handler.
-    type Fut: Future<Output = Result<Out, Self::Err>>;
+    type Fut: Future<Output = Result<B, Self::Err>>;
     /// Process the incoming event and return the response asynchronously.
-    fn call(&mut self, event: In) -> Self::Fut;
+    fn call(&mut self, event: A) -> Self::Fut;
 }
 
 /// A trait describing an asynchronous function from `Request<A>` to `Response<B>`. `A` and `B` must implement [`Deserialize`](serde::Deserialize) and [`Serialize`](serde::Serialize).
@@ -333,21 +357,21 @@ where
     let mut config = Config::default();
     config.endpoint = String::from("http://localhost:8000");
     let parts = config.endpoint.parse::<Uri>()?.into_parts();
-    let scheme = parts.scheme.ok_or(format_err!("scheme not found"))?;
-    let authority = parts.authority.ok_or(format_err!("authority not found"))?;
+    let scheme = parts.scheme.ok_or(err_fmt!("scheme not found"))?;
+    let authority = parts.authority.ok_or(err_fmt!("authority not found"))?;
 
     let client = Client::new(scheme, authority);
     let mut stream = EventStream::new(&client);
 
     while let Some(event) = stream.next().await {
         let (parts, body) = event?.into_parts();
-        let ctx = types::LambdaCtx::try_from(parts.headers)?;
+        let ctx: LambdaCtx = LambdaCtx::try_from(parts.headers)?;
         let body = serde_json::from_slice(&body)?;
 
         match handler.call(body).await {
             Ok(res) => {
                 let res = serde_json::to_vec(&res)?;
-                let uri = generate_uri(&ctx.aws_request_id, Route::Ok)?;
+                let uri = format!("/runtime/invocation/{}/response", ctx.id).parse::<Uri>()?;
                 let req = Request::builder()
                     .uri(uri)
                     .method(Method::POST)
@@ -358,7 +382,7 @@ where
             Err(err) => {
                 let err = error(err.into());
                 let err = serde_json::to_vec(&err)?;
-                let uri = generate_uri(&ctx.aws_request_id, Route::Err)?;
+                let uri = format!("/runtime/invocation/{}/error", ctx.id).parse::<Uri>()?;
                 let req = Request::builder()
                     .uri(uri)
                     .method(Method::POST)
@@ -372,19 +396,6 @@ where
     Ok(())
 }
 
-enum Route {
-    Err,
-    Ok,
-}
-
-fn generate_uri(id: &str, route: Route) -> Result<Uri, http::uri::InvalidUri> {
-    let uri = match route {
-        Route::Ok => format!("/runtime/invocation/{id}/response", id = id),
-        Route::Err => format!("/runtime/invocation/{id}/error", id = id),
-    };
-    uri.parse::<Uri>()
-}
-
 /// Runs an [HttpHandler].
 pub async fn run_http<F, A, B>(mut handler: F) -> Result<(), Err>
 where
@@ -395,15 +406,15 @@ where
     let mut config = Config::default();
     config.endpoint = String::from("http://localhost:8000");
     let parts = config.endpoint.parse::<Uri>()?.into_parts();
-    let scheme = parts.scheme.ok_or(format_err!("scheme not found"))?;
-    let authority = parts.authority.ok_or(format_err!("authority not found"))?;
+    let scheme = parts.scheme.ok_or(err_fmt!("scheme not found"))?;
+    let authority = parts.authority.ok_or(err_fmt!("authority not found"))?;
 
     let client = Client::new(scheme, authority);
     let mut stream = EventStream::new(&client);
 
     while let Some(event) = stream.next().await {
         let (parts, body) = event?.into_parts();
-        let ctx = types::LambdaCtx::try_from(parts.headers)?;
+        let ctx: LambdaCtx = LambdaCtx::try_from(parts.headers)?;
         let body = serde_json::from_slice(&body)?;
         let req = Request::new(body);
 
@@ -411,7 +422,7 @@ where
             Ok(res) => {
                 let (parts, body) = res.into_parts();
                 let res = serde_json::to_vec(&body)?;
-                let uri = generate_uri(&ctx.aws_request_id, Route::Ok)?;
+                let uri = format!("/runtime/invocation/{}/response", ctx.id).parse::<Uri>()?;
                 let req = Request::builder()
                     .uri(uri)
                     .method(Method::POST)
@@ -422,7 +433,7 @@ where
             Err(err) => {
                 let err = error(err.into());
                 let err = serde_json::to_vec(&err)?;
-                let uri = generate_uri(&ctx.aws_request_id, Route::Err)?;
+                let uri = format!("/runtime/invocation/{}/error", ctx.id).parse::<Uri>()?;
                 let req = Request::builder()
                     .uri(uri)
                     .method(Method::POST)
