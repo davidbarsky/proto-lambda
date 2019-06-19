@@ -84,15 +84,20 @@ impl Config {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 struct Client {
     scheme: Scheme,
     authority: Authority,
+    client: hyper::Client<hyper::client::HttpConnector>,
 }
 
 impl Client {
     fn new(scheme: Scheme, authority: Authority) -> Self {
-        Self { scheme, authority }
+        Self {
+            scheme,
+            authority,
+            client: hyper::Client::new(),
+        }
     }
 }
 
@@ -122,8 +127,9 @@ impl<'a> EventClient<'a> for Client {
         let body = hyper::Body::from(body);
         let req = Request::from_parts(parts, body);
 
+        let res = self.client.request(req).compat();
         let fut = async {
-            let res = hyper::Client::new().request(req).compat().await?;
+            let res = res.await?;
             let (parts, body) = res.into_parts();
             let body = body.compat();
             pin_mut!(body);
