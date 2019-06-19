@@ -300,8 +300,24 @@ where
 {
     type Err = E;
     type Fut = Fut;
-    fn call(&mut self, req: A) -> Self::Fut {
+    fn call(&mut self, req: A, _: LambdaCtx) -> Self::Fut {
         (self.f)(req)
+    }
+}
+
+impl<F, A, B, E, Fut> Handler<A, B> for HandlerFn<F>
+where
+    F: Fn(A, LambdaCtx) -> Fut,
+    A: for<'de> Deserialize<'de>,
+    B: Serialize,
+    E: Into<Err>,
+    Fut: Future<Output = Result<B, E>> + Send,
+{
+    type Err = E;
+    type Fut = Fut;
+    fn call(&mut self, req: A, ctx: LambdaCtx) -> Self::Fut {
+        // we pass along the context here
+        (self.f)(req, ctx)
     }
 }
 
@@ -331,7 +347,7 @@ where
     /// The future response value of this handler.
     type Fut: Future<Output = Result<B, Self::Err>>;
     /// Process the incoming event and return the response asynchronously.
-    fn call(&mut self, event: A) -> Self::Fut;
+    fn call(&mut self, event: A, ctx: LambdaCtx) -> Self::Fut;
 }
 
 /// A trait describing an asynchronous function from `Request<A>` to `Response<B>`. `A` and `B` must implement [`Deserialize`](serde::Deserialize) and [`Serialize`](serde::Serialize).
@@ -374,7 +390,7 @@ where
         let ctx: LambdaCtx = LambdaCtx::try_from(parts.headers)?;
         let body = serde_json::from_slice(&body)?;
 
-        match handler.call(body).await {
+        match handler.call(body, ctx).await {
             Ok(res) => {
                 let res = serde_json::to_vec(&res)?;
                 let uri = format!("/runtime/invocation/{}/response", ctx.id).parse::<Uri>()?;
