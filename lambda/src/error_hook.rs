@@ -52,7 +52,7 @@ pub(crate) fn generate_report(err: Err) -> ErrorReport {
 /// ```
 /// #![feature(async_await)]
 /// 
-/// use lambda::{handler_fn, error_hook};
+/// use lambda::{handler_fn, error_hook, LambdaCtx};
 /// type Err = Box<dyn std::error::Error + Send + Sync + 'static>;
 /// 
 /// #[runtime::main]
@@ -63,7 +63,7 @@ pub(crate) fn generate_report(err: Err) -> ErrorReport {
 ///     Ok(())
 /// }
 ///
-/// async fn func(event: String) -> Result<String, Err> {
+/// async fn func(event: String, _ctx: LambdaCtx) -> Result<String, Err> {
 ///     Ok(event)
 /// }
 ///

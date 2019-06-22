@@ -31,8 +31,8 @@ pub fn lambda(_attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     let result = match inputs.len() {
-        1 => {
-            let arg = match inputs.first().unwrap().into_value() {
+        2 => {
+            let event_arg = match inputs.first().unwrap().into_value() {
                 FnArg::Captured(arg) => arg,
                 _ => {
                     let tokens = quote_spanned! { inputs.span() =>
@@ -41,12 +41,24 @@ pub fn lambda(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     return TokenStream::from(tokens);
                 }
             };
-            let arg_name = &arg.pat;
-            let arg_type = &arg.ty;
+            let ctx_arg = match &inputs[1] {
+                FnArg::Captured(arg) => arg,
+                _ => {
+                    let tokens = quote_spanned! { inputs.span() =>
+                        compile_error!("fn main should take a fully formed argument");
+                    };
+                    return TokenStream::from(tokens);
+                }
+            };
+            let arg_name = &event_arg.pat;
+            let arg_type = &event_arg.ty;
+            let ctx_name = &ctx_arg.pat;
+            let ctx_type = &ctx_arg.ty;
+            // TODO: Validate that ctx_type is LambdaCtx
             quote_spanned! { input.span() =>
                 #(#attrs)*
                 #asyncness fn main() {
-                    async fn actual(#arg_name: #arg_type) #ret {
+                    async fn actual(#arg_name: #arg_type, #ctx_name: #ctx_type) #ret {
                         #body
                     }
                     let f = lambda::handler_fn(actual);
@@ -57,7 +69,7 @@ pub fn lambda(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
         _ => {
             let tokens = quote_spanned! { inputs.span() =>
-                compile_error!("fn main can only take 1 argument");
+                compile_error!("fn main can only take 2 arguments: The event and the Lambda context");
             };
             return TokenStream::from(tokens);
         }

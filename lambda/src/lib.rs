@@ -7,15 +7,18 @@
 //! use the `#[lambda]` macro on your `async` main method to automatically generate
 //! the code necessary to start the runtime and listen for events.
 //! 
+//! The `#[lambda]` function must conform to the [`Handler`] trait: It must receive
+//! two parameter for the event and the Lambda context and return a `Result`
+//! 
 //! ```
 //! #![feature(async_await)]
 //! 
-//! use lambda::lambda;
+//! use lambda::{lambda, LambdaCtx};
 //! type Err = Box<dyn std::error::Error + Send + Sync + 'static>;
 //! 
 //! #[lambda]
 //! #[runtime::main]
-//! async fn main(event: String) -> Result<String, Err> {
+//! async fn main(event: String, _ctx: LambdaCtx) -> Result<String, Err> {
 //!     Ok(event)
 //! }
 //! ```
@@ -99,7 +102,11 @@ where
     /// The future response value of this handler.
     type Fut: Future<Output = Result<Output, Self::Err>>;
     /// Process the incoming event and return the response asynchronously.
-    fn call(&mut self, event: Event) -> Self::Fut;
+    /// 
+    /// # Arguments
+    /// * `event` - The data received in the invocation request
+    /// * `ctx` - The context for the current invocation
+    fn call(&mut self, event: Event, ctx: LambdaCtx) -> Self::Fut;
 }
 
 pub trait HttpHandler<A, B>: Handler<Request<A>, Response<B>>
@@ -124,7 +131,7 @@ pub struct HandlerFn<Function> {
 
 impl<Function, Event, Output, Error, Fut> Handler<Event, Output> for HandlerFn<Function>
 where
-    Function: Fn(Event) -> Fut,
+    Function: Fn(Event, LambdaCtx) -> Fut,
     Event: for<'de> Deserialize<'de>,
     Output: Serialize,
     Error: Into<Err>,
@@ -132,13 +139,13 @@ where
 {
     type Err = Error;
     type Fut = Fut;
-    fn call(&mut self, req: Event) -> Self::Fut {
+    fn call(&mut self, req: Event, ctx: LambdaCtx) -> Self::Fut {
         // we pass along the context here
-        (self.f)(req)
+        (self.f)(req, ctx)
     }
 }
 
-impl<Function, Event, Output, Error, Fut> HttpHandler<Event, Output> for HandlerFn<Function>
+/*impl<Function, Event, Output, Error, Fut> HttpHandler<Event, Output> for HandlerFn<Function>
 where
     Function: Fn(Request<Event>) -> Fut,
     Request<Event>: for<'de> Deserialize<'de>,
@@ -149,7 +156,7 @@ where
     fn call_http(&mut self, req: Request<Event>) -> Self::Fut {
         (self.f)(req)
     }
-}
+}*/
 
 /// Starts the Lambda Rust runtime and begins polling for events on the [Lambda
 /// Runtime APIs](https://docs.aws.amazon.com/lambda/latest/dg/runtimes-api.html).
@@ -161,7 +168,7 @@ where
 /// ```
 /// #![feature(async_await)]
 /// 
-/// use lambda::handler_fn;
+/// use lambda::{handler_fn, LambdaCtx};
 /// type Err = Box<dyn std::error::Error + Send + Sync + 'static>;
 /// 
 /// #[runtime::main]
@@ -171,7 +178,7 @@ where
 ///     Ok(())
 /// }
 /// 
-/// async fn func(event: String) -> Result<String, Err> {
+/// async fn func(event: String, _ctx: LambdaCtx) -> Result<String, Err> {
 ///     Ok(event)
 /// }
 /// ```
@@ -194,15 +201,20 @@ where
 
     while let Some(event) = stream.next().await {
         let (parts, body) = event?.into_parts();
-        let mut ctx: LambdaCtx<'_> = LambdaCtx::try_from(parts.headers)?;
-        ctx.env_config = Some(&config);
+        let mut ctx: LambdaCtx = LambdaCtx::try_from(parts.headers)?;
+        // we are cloning the config each time here because placing a reference to it 
+        // in the context would burden the Lambda function developer with specifying 
+        // lifetimes all along the way. Since the object is small cloning should not
+        // be a big operation. - last famous workd - I will pay for my sins some day.
+        ctx.env_config = Some(config.clone());
+        let req_id = ctx.id.clone();
         
         let body = serde_json::from_slice(&body)?;
 
-        match handler.call(body).await {
+        match handler.call(body, ctx).await {
             Ok(res) => {
                 let res = serde_json::to_vec(&res)?;
-                let uri = format!("/runtime/invocation/{}/response", ctx.id).parse::<Uri>()?;
+                let uri = format!("/runtime/invocation/{}/response", req_id).parse::<Uri>()?;
                 let req = Request::builder()
                     .uri(uri)
                     .method(Method::POST)
@@ -213,7 +225,7 @@ where
             Err(err) => {
                 let err = error_hook::generate_report(err.into());
                 let err = serde_json::to_vec(&err)?;
-                let uri = format!("/runtime/invocation/{}/error", ctx.id).parse::<Uri>()?;
+                let uri = format!("/runtime/invocation/{}/error", req_id).parse::<Uri>()?;
                 let req = Request::builder()
                     .uri(uri)
                     .method(Method::POST)
@@ -280,7 +292,7 @@ where
 
 #[runtime::test]
 async fn get_next() -> Result<(), Err> {
-    async fn test_fn(req: String) -> Result<String, Err> {
+    async fn test_fn(req: String, _ctx: LambdaCtx) -> Result<String, Err> {
         Ok(req)
     }
 
