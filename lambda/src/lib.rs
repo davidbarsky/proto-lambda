@@ -2,23 +2,37 @@
 #![deny(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![warn(missing_docs, nonstandard_style, rust_2018_idioms)]
 
-//! This is the core of the Lambda Runtime.
+//! This crate is the official Rust runtime for AWS Lambda. Lambda functions written
+//! in Rust are executable binaries that include this runtime as a dependency. You can 
+//! use the `#[lambda]` macro on your `async` main method to automatically generate
+//! the code necessary to start the runtime and listen for events.
+//! 
+//! ```
+//! #![feature(async_await)]
+//! 
+//! use lambda::lambda;
+//! type Err = Box<dyn std::error::Error + Send + Sync + 'static>;
+//! 
+//! #[lambda]
+//! #[runtime::main]
+//! async fn main(event: String) -> Result<String, Err> {
+//!     Ok(event)
+//! }
+//! ```
 use bytes::Bytes;
 use futures::prelude::*;
 use http::{response::Parts, Method, Request, Response, Uri};
 use serde::{Deserialize, Serialize};
 use std::{convert::TryFrom, env};
-
+pub use crate::types::LambdaCtx;
+use client::{Client, EventClient, EventStream};
 pub use lambda_attributes::lambda;
 
 mod client;
+/// Types availible to a Lambda function.
+mod types;
 /// Mechanism to provide a custom error reporting hook.
 pub mod error_hook;
-/// Types availible to a Lambda function.
-pub mod types;
-use crate::{error_hook::generate_report, types::LambdaCtx};
-
-use client::{Client, EventClient, EventStream};
 
 type Err = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -43,7 +57,7 @@ macro_rules! err_fmt {
 }
 
 /// A struct containing configuration values derived from environment variables.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Config {
     /// The host and port of the [runtime API](https://docs.aws.amazon.com/lambda/latest/dg/runtimes-api.html).
     pub endpoint: String,
@@ -75,17 +89,17 @@ impl Config {
 }
 
 /// A trait describing an asynchronous function from `In` to `Out`. `In` and `Out` must implement [`Deserialize`](serde::Deserialize) and [`Serialize`](serde::Serialize).
-pub trait Handler<A, B>
+pub trait Handler<Event, Output>
 where
-    A: for<'de> Deserialize<'de>,
-    B: Serialize,
+    Event: for<'de> Deserialize<'de>,
+    Output: Serialize,
 {
     /// Errors returned by this handler.
     type Err: Into<Err>;
     /// The future response value of this handler.
-    type Fut: Future<Output = Result<B, Self::Err>>;
+    type Fut: Future<Output = Result<Output, Self::Err>>;
     /// Process the incoming event and return the response asynchronously.
-    fn call(&mut self, event: A) -> Self::Fut;
+    fn call(&mut self, event: Event) -> Self::Fut;
 }
 
 pub trait HttpHandler<A, B>: Handler<Request<A>, Response<B>>
@@ -98,53 +112,76 @@ where
 }
 
 /// Returns a new `HandlerFn` with the given closure.
-pub fn handler_fn<F>(f: F) -> HandlerFn<F> {
+pub fn handler_fn<Function>(f: Function) -> HandlerFn<Function> {
     HandlerFn { f }
 }
 
 /// A `Handler` or `HttpHandler` implemented by a closure.
 #[derive(Copy, Clone, Debug)]
-pub struct HandlerFn<F> {
-    f: F,
+pub struct HandlerFn<Function> {
+    f: Function,
 }
 
-impl<F, A, B, E, Fut> Handler<A, B> for HandlerFn<F>
+impl<Function, Event, Output, Error, Fut> Handler<Event, Output> for HandlerFn<Function>
 where
-    F: Fn(A) -> Fut,
-    A: for<'de> Deserialize<'de>,
-    B: Serialize,
-    E: Into<Err>,
-    Fut: Future<Output = Result<B, E>> + Send,
+    Function: Fn(Event) -> Fut,
+    Event: for<'de> Deserialize<'de>,
+    Output: Serialize,
+    Error: Into<Err>,
+    Fut: Future<Output = Result<Output, Error>> + Send,
 {
-    type Err = E;
+    type Err = Error;
     type Fut = Fut;
-    fn call(&mut self, req: A) -> Self::Fut {
+    fn call(&mut self, req: Event) -> Self::Fut {
         // we pass along the context here
         (self.f)(req)
     }
 }
 
-impl<F, A, B, E, Fut> HttpHandler<A, B> for HandlerFn<F>
+impl<Function, Event, Output, Error, Fut> HttpHandler<Event, Output> for HandlerFn<Function>
 where
-    F: Fn(Request<A>) -> Fut,
-    Request<A>: for<'de> Deserialize<'de>,
-    Response<B>: Serialize,
-    E: Into<Err>,
-    Fut: Send + Future<Output = Result<Response<B>, E>>,
+    Function: Fn(Request<Event>) -> Fut,
+    Request<Event>: for<'de> Deserialize<'de>,
+    Response<Output>: Serialize,
+    Error: Into<Err>,
+    Fut: Send + Future<Output = Result<Response<Output>, Error>>,
 {
-    fn call_http(&mut self, req: Request<A>) -> Self::Fut {
+    fn call_http(&mut self, req: Request<Event>) -> Self::Fut {
         (self.f)(req)
     }
 }
 
-/// Runs an [Handler].
-pub async fn run<F, A, B>(
-    mut handler: F,
+/// Starts the Lambda Rust runtime and begins polling for events on the [Lambda
+/// Runtime APIs](https://docs.aws.amazon.com/lambda/latest/dg/runtimes-api.html).
+/// 
+/// # Arguments
+/// * `handler` - A function or closure that conforms to the `Handler` trait
+/// 
+/// # Example
+/// ```
+/// #![feature(async_await)]
+/// 
+/// use lambda::handler_fn;
+/// type Err = Box<dyn std::error::Error + Send + Sync + 'static>;
+/// 
+/// #[runtime::main]
+/// async fn main() -> Result<(), Err> {
+///     let func = handler_fn(func);
+///     lambda::run(func).await?;
+///     Ok(())
+/// }
+/// 
+/// async fn func(event: String) -> Result<String, Err> {
+///     Ok(event)
+/// }
+/// ```
+pub async fn run<Function, Event, Output>(
+    mut handler: Function,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>
 where
-    F: Handler<A, B>,
-    A: for<'de> Deserialize<'de>,
-    B: Serialize,
+    Function: Handler<Event, Output>,
+    Event: for<'de> Deserialize<'de>,
+    Output: Serialize,
 {
     let mut config = Config::default();
     config.endpoint = String::from("http://localhost:8000");
@@ -157,7 +194,9 @@ where
 
     while let Some(event) = stream.next().await {
         let (parts, body) = event?.into_parts();
-        let ctx: LambdaCtx = LambdaCtx::try_from(parts.headers)?;
+        let mut ctx: LambdaCtx<'_> = LambdaCtx::try_from(parts.headers)?;
+        ctx.env_config = Some(&config);
+        
         let body = serde_json::from_slice(&body)?;
 
         match handler.call(body).await {
