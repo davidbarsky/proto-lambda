@@ -10,6 +10,6 @@ async fn main() -> Result<(), Err> {
     Ok(())
 }
 
-async fn func(event: String, _ctx: LambdaCtx) -> Result<String, Err> {
+async fn func(event: String, _: Option<LambdaCtx>) -> Result<String, Err> {
     Ok(event)
 }

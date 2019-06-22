@@ -180,9 +180,9 @@ pub struct LambdaCtx {
     /// credentials issues by Amazon Cognito Identity Pools.
     pub identity: Option<CognitoIdentity>,
     /// Lambda function configuration from the local environment variables.
-    /// Includes information such as the function name, memory allocation, 
+    /// Includes information such as the function name, memory allocation,
     /// version, and log streams.
-    pub env_config: Option<Config>,
+    pub env_config: Config,
 }
 
 impl TryFrom<HeaderMap<HeaderValue>> for LambdaCtx {

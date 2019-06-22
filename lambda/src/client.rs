@@ -1,30 +1,54 @@
-use crate::Err;
+use crate::{err_fmt, Err};
 use bytes::Bytes;
 use futures::{
     future::BoxFuture,
     prelude::*,
     task::{Context, Poll},
 };
-use http::{
-    uri::{Authority, Scheme},
-    Method, Request, Response, Uri,
-};
+use http::{Method, Request, Response, Uri};
+use hyper::Body;
 use std::{marker::Unpin, pin::Pin};
 
 #[derive(Debug)]
 pub(crate) struct Client {
-    scheme: Scheme,
-    authority: Authority,
+    base: Uri,
     client: hyper::Client<hyper::client::HttpConnector>,
 }
 
 impl Client {
-    pub(crate) fn new(scheme: Scheme, authority: Authority) -> Self {
+    pub(crate) fn new(uri: Uri) -> Self {
         Self {
-            scheme,
-            authority,
+            base: uri,
             client: hyper::Client::new(),
         }
+    }
+
+    fn set_origin<B>(&self, req: Request<B>) -> Result<Request<B>, Err> {
+        let (mut parts, body) = req.into_parts();
+        let (scheme, authority) = {
+            let scheme = self
+                .base
+                .scheme_part()
+                .ok_or(err_fmt!("PathAndQuery not found"))?;
+            let authority = self
+                .base
+                .authority_part()
+                .ok_or(err_fmt!("PathAndQuery not found"))?;
+            (scheme, authority)
+        };
+        let path = parts
+            .uri
+            .path_and_query()
+            .ok_or(err_fmt!("PathAndQuery not found"))?;
+
+        let uri = Uri::builder()
+            .scheme(scheme.clone())
+            .authority(authority.clone())
+            .path_and_query(path.clone())
+            .build()?;
+
+        parts.uri = uri;
+        Ok(Request::from_parts(parts, body))
     }
 }
 
@@ -42,18 +66,12 @@ impl<'a> EventClient<'a> for Client {
         use futures::compat::{Future01CompatExt, Stream01CompatExt};
         use pin_utils::pin_mut;
 
-        let (mut parts, body) = req.into_parts();
-        let pq = parts.uri.path_and_query().unwrap();
-        let uri = Uri::builder()
-            .scheme(self.scheme.clone())
-            .authority(self.authority.clone())
-            .path_and_query(pq.clone())
-            .build()
-            .unwrap();
-        parts.uri = uri;
-        let body = hyper::Body::from(body);
-        let req = Request::from_parts(parts, body);
-
+        let req = {
+            let (parts, body) = req.into_parts();
+            let body = Body::from(body);
+            Request::from_parts(parts, body)
+        };
+        let req = self.set_origin(req).unwrap();
         let res = self.client.request(req).compat();
         let fut = async {
             let res = res.await?;
