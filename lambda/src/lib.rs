@@ -157,19 +157,6 @@ where
     }
 }
 
-/*impl<Function, Event, Output, Error, Fut> HttpHandler<Event, Output> for HandlerFn<Function>
-where
-    Function: Fn(Request<Event>) -> Fut,
-    Request<Event>: for<'de> Deserialize<'de>,
-    Response<Output>: Serialize,
-    Error: Into<Err>,
-    Fut: Send + Future<Output = Result<Response<Output>, Error>>,
-{
-    fn call_http(&mut self, req: Request<Event>) -> Self::Fut {
-        (self.f)(req)
-    }
-}*/
-
 /// Starts the Lambda Rust runtime and begins polling for events on the [Lambda
 /// Runtime APIs](https://docs.aws.amazon.com/lambda/latest/dg/runtimes-api.html).
 ///
@@ -240,57 +227,6 @@ where
 
     Ok(())
 }
-
-/// Runs an [HttpHandler].
-// pub async fn run_http<F, A, B>(mut handler: F) -> Result<(), Err>
-// where
-//     F: HttpHandler<A, B>,
-//     Request<A>: for<'de> Deserialize<'de>,
-//     Response<B>: Serialize,
-// {
-//     let mut config = Config::default();
-//     config.endpoint = String::from("http://localhost:8000");
-//     let parts = config.endpoint.parse::<Uri>()?.into_parts();
-//     let scheme = parts.scheme.ok_or(err_fmt!("scheme not found"))?;
-//     let authority = parts.authority.ok_or(err_fmt!("authority not found"))?;
-
-//     let client = Client::new(scheme, authority);
-//     let mut stream = EventStream::new(&client);
-
-//     while let Some(event) = stream.next().await {
-//         let (parts, body): (Parts, Bytes) = event?.into_parts();
-//         let ctx: LambdaCtx = LambdaCtx::try_from(parts.headers)?;
-//         let body = serde_json::from_slice(&body)?;
-//         let req = Request::new(body);
-
-//         match handler.call_http(req).await {
-//             Ok(res) => {
-//                 let (parts, body) = res.into_parts();
-//                 // let res = serde_json::to_vec(&body)?;
-//                 let uri = format!("/runtime/invocation/{}/response", ctx.id).parse::<Uri>()?;
-//                 let req = Request::builder()
-//                     .uri(uri)
-//                     .method(Method::POST)
-//                     .body(Bytes::from(res))?;
-
-//                 client.call(req).await?;
-//             }
-//             Err(err) => {
-//                 let err = generate_report(err.into());
-//                 let err = serde_json::to_vec(&err)?;
-//                 let uri = format!("/runtime/invocation/{}/error", ctx.id).parse::<Uri>()?;
-//                 let req = Request::builder()
-//                     .uri(uri)
-//                     .method(Method::POST)
-//                     .body(Bytes::from(err))?;
-
-//                 client.call(req).await?;
-//             }
-//         }
-//     }
-
-//     Ok(())
-// }
 
 #[runtime::test]
 async fn get_next() -> Result<(), Err> {
