@@ -1,6 +1,6 @@
 #![feature(async_await)]
 
-use lambda::handler_fn;
+use lambda::{handler_fn, LambdaCtx};
 type Err = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 #[runtime::main]
@@ -10,8 +10,6 @@ async fn main() -> Result<(), Err> {
     Ok(())
 }
 
-async fn func(event: String) -> Result<String, Err> {
-    // note the absense of a context—the context will
-    // be propogated through a task local.
+async fn func(event: String, _: Option<LambdaCtx>) -> Result<String, Err> {
     Ok(event)
 }

@@ -28,7 +28,7 @@ fn default_error_hook(err: Err) -> ErrorReport {
 /// Transforms
 ///
 /// This function is called by the Lambda Runtime if an error is returned from a Handler.
-/// This implementation is a near-direct copy of [std::alloc::set_alloc_error_hook], down
+/// This implementation is a near-direct copy of [`std::alloc::set_alloc_error_hook`], down
 /// to the transmute operation.
 pub(crate) fn generate_report(err: Err) -> ErrorReport {
     let hook = HOOK.load(Ordering::SeqCst);
@@ -42,11 +42,38 @@ pub(crate) fn generate_report(err: Err) -> ErrorReport {
 
 /// Registers a custom error hook, replacing any that was previously registered.
 ///
-/// The Lambda error hook is invoked when a [Handler] or [HttpHandler] returns an error, but prior
+/// The Lambda error hook is invoked when a [`Handler`] or [`HttpHandler`] returns an error, but prior
 /// to the runtime reporting the error to the Lambda Runtime APIs. This hook is intended to be used
 /// by those interested in programatialy
 ///
-/// This function, in terms of intended usage and implementation, mimics [std::alloc::set_alloc_error_hook].
+/// This function, in terms of intended usage and implementation, mimics [`std::alloc::set_alloc_error_hook`].
+/// 
+/// # Example
+/// ```
+/// #![feature(async_await)]
+/// 
+/// use lambda::{handler_fn, error_hook, LambdaCtx};
+/// type Err = Box<dyn std::error::Error + Send + Sync + 'static>;
+/// 
+/// #[runtime::main]
+/// async fn main() -> Result<(), Err> {
+///     let func = handler_fn(func);
+///     error_hook::set_error_hook(error_hook);
+///     lambda::run(func).await?;
+///     Ok(())
+/// }
+///
+/// async fn func(event: String, _ctx: LambdaCtx) -> Result<String, Err> {
+///     Ok(event)
+/// }
+///
+/// fn error_hook(e: Err) -> error_hook::ErrorReport {
+///     error_hook::ErrorReport{
+///         name: String::from("CustomError"),
+///         err: format!("{}", e),
+///     }
+/// }
+/// ```
 pub fn set_error_hook<E: Into<Err>>(hook: fn(err: E) -> ErrorReport) {
     HOOK.store(hook as *mut (), Ordering::SeqCst);
 }

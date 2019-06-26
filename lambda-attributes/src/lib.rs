@@ -32,7 +32,7 @@ pub fn lambda(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let result = match inputs.len() {
         1 => {
-            let arg = match inputs.first().unwrap().into_value() {
+            let event = match inputs.first().unwrap().into_value() {
                 FnArg::Captured(arg) => arg,
                 _ => {
                     let tokens = quote_spanned! { inputs.span() =>
@@ -41,12 +41,49 @@ pub fn lambda(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     return TokenStream::from(tokens);
                 }
             };
-            let arg_name = &arg.pat;
-            let arg_type = &arg.ty;
+            let arg_name = &event.pat;
+            let arg_type = &event.ty;
+
             quote_spanned! { input.span() =>
                 #(#attrs)*
                 #asyncness fn main() {
-                    async fn actual(#arg_name: #arg_type) #ret {
+                    async fn actual(#arg_name: #arg_type, ctx: Option<lambda::LambdaCtx>) #ret {
+                        #body
+                    }
+                    let f = lambda::handler_fn(actual);
+
+                    lambda::run(f).await.unwrap();
+                }
+            }
+        }
+        2 => {
+            let event = match inputs.first().unwrap().into_value() {
+                FnArg::Captured(arg) => arg,
+                _ => {
+                    let tokens = quote_spanned! { inputs.span() =>
+                        compile_error!("fn main should take a fully formed argument");
+                    };
+                    return TokenStream::from(tokens);
+                }
+            };
+            let ctx = match &inputs[1] {
+                FnArg::Captured(arg) => arg,
+                _ => {
+                    let tokens = quote_spanned! { inputs.span() =>
+                        compile_error!("fn main should take a fully formed argument");
+                    };
+                    return TokenStream::from(tokens);
+                }
+            };
+            let arg_name = &event.pat;
+            let arg_type = &event.ty;
+            let ctx_name = &ctx.pat;
+            let ctx_type = &ctx.ty;
+            quote_spanned! { input.span() =>
+                #(#attrs)*
+                #asyncness fn main() {
+                    async fn actual(#arg_name: #arg_type, #ctx_name: Option<#ctx_type>) #ret {
+                        let #ctx_name = #ctx_name.unwrap();
                         #body
                     }
                     let f = lambda::handler_fn(actual);
@@ -57,7 +94,7 @@ pub fn lambda(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
         _ => {
             let tokens = quote_spanned! { inputs.span() =>
-                compile_error!("fn main can only take 1 argument");
+                compile_error!("The #[lambda] macro can accept one or two arguments.");
             };
             return TokenStream::from(tokens);
         }

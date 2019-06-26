@@ -2,23 +2,51 @@
 #![deny(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![warn(missing_docs, nonstandard_style, rust_2018_idioms)]
 
-//! This is the core of the Lambda Runtime.
+//! The official Rust runtime for AWS Lambda.
+//!
+//! There are two mechanisms of defining a Lambda function:
+//! 1. The `#[lambda]` attribute, which generates the boilerplate needed to
+//!    to launch and run a Lambda function. The `#[lambda]` attribute _must_
+//!    be placed on an asynchronous main funtion. However, asynchronous main
+//!    funtions are not legal valid Rust, which means that a crate like
+//!    [Runtime](https://github.com/rustasync/runtime) must be used. A main function
+//!    decorated using `#[lamdba]`
+//! 2. A type that conforms to the [`Handler`] trait. This type can then be passed
+//!    to the the `lambda::run` function, which launches and runs the Lambda runtime.
+//!
+//! An asynchronous function annotated with the `#[lambda]` attribute must
+//! accept an argument of type `A` which implements [`serde::Deserialize`] and
+//! return a `Result<B, E>`, where `B` implements [serde::Serializable]. `E` is
+//! any type that implements `Into<Box<dyn std::error::Error + Send + Sync + 'static>>`.
+//!
+//! Optionally, the `#[lambda]` annotated function can accept an argument
+//! of [`lambda::LambdaCtx`].
+//!
+//! ```rust
+//! #![feature(async_await)]
+//!
+//! type Err = Box<dyn std::error::Error + Send + Sync + 'static>;
+//!
+//! #[lambda]
+//! #[runtime::main]
+//! async fn main(event: String) -> Result<String, Err> {
+//!     Ok(event)
+//! }
+//! ```
+pub use crate::types::LambdaCtx;
 use bytes::Bytes;
+use client::{Client, EventClient, EventStream};
 use futures::prelude::*;
-use http::{response::Parts, Method, Request, Response, Uri};
+use http::{Method, Request, Response, Uri};
+pub use lambda_attributes::lambda;
 use serde::{Deserialize, Serialize};
 use std::{convert::TryFrom, env};
-
-pub use lambda_attributes::lambda;
 
 mod client;
 /// Mechanism to provide a custom error reporting hook.
 pub mod error_hook;
 /// Types availible to a Lambda function.
-pub mod types;
-use crate::{error_hook::generate_report, types::LambdaCtx};
-
-use client::{Client, EventClient, EventStream};
+mod types;
 
 type Err = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -43,7 +71,7 @@ macro_rules! err_fmt {
 }
 
 /// A struct containing configuration values derived from environment variables.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Config {
     /// The host and port of the [runtime API](https://docs.aws.amazon.com/lambda/latest/dg/runtimes-api.html).
     pub endpoint: String,
@@ -74,20 +102,25 @@ impl Config {
     }
 }
 
-/// A trait describing an asynchronous function from `In` to `Out`. `In` and `Out` must implement [`Deserialize`](serde::Deserialize) and [`Serialize`](serde::Serialize).
-pub trait Handler<A, B>
+/// A trait describing an asynchronous function from `Event` to `Output`. `Event` and `Output` must implement [`Deserialize`](serde::Deserialize) and [`Serialize`](serde::Serialize).
+pub trait Handler<Event, Output>
 where
-    A: for<'de> Deserialize<'de>,
-    B: Serialize,
+    Event: for<'de> Deserialize<'de>,
+    Output: Serialize,
 {
     /// Errors returned by this handler.
     type Err: Into<Err>;
     /// The future response value of this handler.
-    type Fut: Future<Output = Result<B, Self::Err>>;
+    type Fut: Future<Output = Result<Output, Self::Err>>;
     /// Process the incoming event and return the response asynchronously.
-    fn call(&mut self, event: A) -> Self::Fut;
+    ///
+    /// # Arguments
+    /// * `event` - The data received in the invocation request
+    /// * `ctx` - The context for the current invocation
+    fn call(&mut self, event: Event, ctx: Option<LambdaCtx>) -> Self::Fut;
 }
 
+/// A trait describing an asynchronous function from `Request<A>` to `Response<B>`. `A` and `B` must implement [`Deserialize`](serde::Deserialize) and [`Serialize`](serde::Serialize).
 pub trait HttpHandler<A, B>: Handler<Request<A>, Response<B>>
 where
     Request<A>: for<'de> Deserialize<'de>,
@@ -98,72 +131,79 @@ where
 }
 
 /// Returns a new `HandlerFn` with the given closure.
-pub fn handler_fn<F>(f: F) -> HandlerFn<F> {
+pub fn handler_fn<Function>(f: Function) -> HandlerFn<Function> {
     HandlerFn { f }
 }
 
 /// A `Handler` or `HttpHandler` implemented by a closure.
 #[derive(Copy, Clone, Debug)]
-pub struct HandlerFn<F> {
-    f: F,
+pub struct HandlerFn<Function> {
+    f: Function,
 }
 
-impl<F, A, B, E, Fut> Handler<A, B> for HandlerFn<F>
+impl<Function, Event, Output, Error, Fut> Handler<Event, Output> for HandlerFn<Function>
 where
-    F: Fn(A) -> Fut,
-    A: for<'de> Deserialize<'de>,
-    B: Serialize,
-    E: Into<Err>,
-    Fut: Future<Output = Result<B, E>> + Send,
+    Function: Fn(Event, Option<LambdaCtx>) -> Fut,
+    Event: for<'de> Deserialize<'de>,
+    Output: Serialize,
+    Error: Into<Err>,
+    Fut: Future<Output = Result<Output, Error>> + Send,
 {
-    type Err = E;
+    type Err = Error;
     type Fut = Fut;
-    fn call(&mut self, req: A) -> Self::Fut {
+    fn call(&mut self, req: Event, ctx: Option<LambdaCtx>) -> Self::Fut {
         // we pass along the context here
-        (self.f)(req)
+        (self.f)(req, ctx)
     }
 }
 
-impl<F, A, B, E, Fut> HttpHandler<A, B> for HandlerFn<F>
-where
-    F: Fn(Request<A>) -> Fut,
-    Request<A>: for<'de> Deserialize<'de>,
-    Response<B>: Serialize,
-    E: Into<Err>,
-    Fut: Send + Future<Output = Result<Response<B>, E>>,
-{
-    fn call_http(&mut self, req: Request<A>) -> Self::Fut {
-        (self.f)(req)
-    }
-}
-
-/// Runs an [Handler].
-pub async fn run<F, A, B>(
-    mut handler: F,
+/// Starts the Lambda Rust runtime and begins polling for events on the [Lambda
+/// Runtime APIs](https://docs.aws.amazon.com/lambda/latest/dg/runtimes-api.html).
+///
+/// # Arguments
+/// * `handler` - A function or closure that conforms to the `Handler` trait
+///
+/// # Example
+/// ```
+/// #![feature(async_await)]
+///
+/// use lambda::{handler_fn, LambdaCtx};
+/// type Err = Box<dyn std::error::Error + Send + Sync + 'static>;
+///
+/// #[runtime::main]
+/// async fn main() -> Result<(), Err> {
+///     let func = handler_fn(func);
+///     lambda::run(func).await?;
+///     Ok(())
+/// }
+///
+/// async fn func(event: String, _ctx: LambdaCtx) -> Result<String, Err> {
+///     Ok(event)
+/// }
+/// ```
+pub async fn run<Function, Event, Output>(
+    mut handler: Function,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>
 where
-    F: Handler<A, B>,
-    A: for<'de> Deserialize<'de>,
-    B: Serialize,
+    Function: Handler<Event, Output>,
+    Event: for<'de> Deserialize<'de>,
+    Output: Serialize,
 {
-    let mut config = Config::default();
-    config.endpoint = String::from("http://localhost:8000");
-    let parts = config.endpoint.parse::<Uri>()?.into_parts();
-    let scheme = parts.scheme.ok_or(err_fmt!("scheme not found"))?;
-    let authority = parts.authority.ok_or(err_fmt!("authority not found"))?;
-
-    let client = Client::new(scheme, authority);
+    let uri: Bytes = env::var("AWS_LAMBDA_RUNTIME_API")?.into();
+    let uri = Uri::from_shared(uri)?;
+    let client = Client::new(uri);
     let mut stream = EventStream::new(&client);
 
     while let Some(event) = stream.next().await {
         let (parts, body) = event?.into_parts();
-        let ctx: LambdaCtx = LambdaCtx::try_from(parts.headers)?;
+        let mut ctx: LambdaCtx = LambdaCtx::try_from(parts.headers)?;
+        ctx.env_config = Config::from_env()?;
         let body = serde_json::from_slice(&body)?;
 
-        match handler.call(body).await {
+        match handler.call(body, Some(ctx.clone())).await {
             Ok(res) => {
                 let res = serde_json::to_vec(&res)?;
-                let uri = format!("/runtime/invocation/{}/response", ctx.id).parse::<Uri>()?;
+                let uri = format!("/runtime/invocation/{}/response", &ctx.id).parse::<Uri>()?;
                 let req = Request::builder()
                     .uri(uri)
                     .method(Method::POST)
@@ -174,7 +214,7 @@ where
             Err(err) => {
                 let err = error_hook::generate_report(err.into());
                 let err = serde_json::to_vec(&err)?;
-                let uri = format!("/runtime/invocation/{}/error", ctx.id).parse::<Uri>()?;
+                let uri = format!("/runtime/invocation/{}/error", &ctx.id).parse::<Uri>()?;
                 let req = Request::builder()
                     .uri(uri)
                     .method(Method::POST)
@@ -188,60 +228,9 @@ where
     Ok(())
 }
 
-/// Runs an [HttpHandler].
-// pub async fn run_http<F, A, B>(mut handler: F) -> Result<(), Err>
-// where
-//     F: HttpHandler<A, B>,
-//     Request<A>: for<'de> Deserialize<'de>,
-//     Response<B>: Serialize,
-// {
-//     let mut config = Config::default();
-//     config.endpoint = String::from("http://localhost:8000");
-//     let parts = config.endpoint.parse::<Uri>()?.into_parts();
-//     let scheme = parts.scheme.ok_or(err_fmt!("scheme not found"))?;
-//     let authority = parts.authority.ok_or(err_fmt!("authority not found"))?;
-
-//     let client = Client::new(scheme, authority);
-//     let mut stream = EventStream::new(&client);
-
-//     while let Some(event) = stream.next().await {
-//         let (parts, body): (Parts, Bytes) = event?.into_parts();
-//         let ctx: LambdaCtx = LambdaCtx::try_from(parts.headers)?;
-//         let body = serde_json::from_slice(&body)?;
-//         let req = Request::new(body);
-
-//         match handler.call_http(req).await {
-//             Ok(res) => {
-//                 let (parts, body) = res.into_parts();
-//                 // let res = serde_json::to_vec(&body)?;
-//                 let uri = format!("/runtime/invocation/{}/response", ctx.id).parse::<Uri>()?;
-//                 let req = Request::builder()
-//                     .uri(uri)
-//                     .method(Method::POST)
-//                     .body(Bytes::from(res))?;
-
-//                 client.call(req).await?;
-//             }
-//             Err(err) => {
-//                 let err = generate_report(err.into());
-//                 let err = serde_json::to_vec(&err)?;
-//                 let uri = format!("/runtime/invocation/{}/error", ctx.id).parse::<Uri>()?;
-//                 let req = Request::builder()
-//                     .uri(uri)
-//                     .method(Method::POST)
-//                     .body(Bytes::from(err))?;
-
-//                 client.call(req).await?;
-//             }
-//         }
-//     }
-
-//     Ok(())
-// }
-
 #[runtime::test]
 async fn get_next() -> Result<(), Err> {
-    async fn test_fn(req: String) -> Result<String, Err> {
+    async fn test_fn(req: String, _ctx: Option<LambdaCtx>) -> Result<String, Err> {
         Ok(req)
     }
 
