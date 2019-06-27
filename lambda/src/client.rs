@@ -7,7 +7,7 @@ use futures::{
 };
 use http::{Method, Request, Response, Uri};
 use hyper::Body;
-use std::{marker::Unpin, pin::Pin};
+use std::pin::Pin;
 
 #[derive(Debug)]
 pub(crate) struct Client {
@@ -53,7 +53,7 @@ impl Client {
 }
 
 /// A trait modeling interactions with the [Lambda Runtime API](https://docs.aws.amazon.com/lambda/latest/dg/runtimes-api.html).
-pub(crate) trait EventClient<'a>: Send + Sync + Unpin {
+pub(crate) trait EventClient<'a>: Send + Sync {
     /// A future containing the next event from the Lambda Runtime API.
     type Fut: Future<Output = Result<Response<Bytes>, Err>> + Send + 'a;
     fn call(&self, req: Request<Bytes>) -> Self::Fut;
